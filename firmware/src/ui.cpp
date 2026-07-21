@@ -907,7 +907,10 @@ void ui_update_pairing(ble_pair_view_t view, uint32_t code) {
             // zeros reads to the user as "the codes don't match".
             snprintf(buf, sizeof(buf), "%06lu", (unsigned long)code);
             lv_label_set_text(lbl_pin_title, "Same code?");
-            lv_label_set_text(lbl_pin_hint, "press the power button to confirm");
+            lv_label_set_text(lbl_pin_hint,
+                board_caps().button_count >= 1
+                    ? "power button = yes, side button = no"
+                    : "press the power button to confirm");
             break;
         case BLE_PAIR_VIEW_PASSKEY:
             snprintf(buf, sizeof(buf), "%lu", (unsigned long)code);

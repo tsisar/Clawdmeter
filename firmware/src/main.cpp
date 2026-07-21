@@ -331,7 +331,15 @@ void loop() {
         bool primary_now = input_hal_is_held(INPUT_BTN_PRIMARY);
         if (primary_now != primary_was) {
             if (primary_now) {
-                if (idle_consume_wake_press()) primary_wake_swallowed = true;
+                // While a pairing code is on screen this button is the "no,
+                // they don't match" answer. Without it the prompt could only
+                // ever be accepted, which defeats the point of asking — the
+                // user has to be able to refuse a code that differs.
+                if (ble_confirm_pending()) {
+                    ble_confirm_reject();
+                    primary_wake_swallowed = true;  // don't emit Space on release
+                }
+                else if (idle_consume_wake_press()) primary_wake_swallowed = true;
                 else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
             } else {
                 if (primary_wake_swallowed) primary_wake_swallowed = false;

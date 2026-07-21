@@ -150,19 +150,6 @@ static volatile bool     confirm_pending = false;
 static volatile uint16_t confirm_handle  = 0xFFFF;
 static volatile uint32_t confirm_code    = 0;
 
-// Bonds that already existed at boot with an empty owner list — the only
-// addresses the pre-allow-list migration path may adopt (see
-// onAuthenticationComplete). Snapshotted once in ble_init.
-static char legacy_bonds[MAX_OWNERS][18] = {};
-static int  legacy_bond_count = 0;
-
-static bool is_legacy_bond(const char* id) {
-    for (int i = 0; i < legacy_bond_count; i++) {
-        if (strcmp(legacy_bonds[i], id) == 0) return true;
-    }
-    return false;
-}
-
 // Admission stays open for a grace period past the visible window so a PIN
 // typed just before the deadline still lands (SMP finishes after expiry).
 // The armed flag matters: a bare timestamp comparison flips back to "open"
@@ -473,6 +460,12 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             confirm_pending = false;
             Serial.println("BLE: pending confirmation dropped (peer disconnected)");
         }
+        // Handles are recycled, so ceremony state left behind by a closed
+        // connection would later match an unrelated one.
+        if (ceremony_handle == info.getConnHandle()) {
+            ceremony_handle = CONN_HANDLE_NONE;
+            pin_requested = false;
+        }
         Serial.printf("BLE: disconnected (reason=%d, remaining=%u)\n",
             reason, (unsigned)s->getConnectedCount());
     }
@@ -512,7 +505,12 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             pairing_pin_val = 1000 + (esp_random() % 9000);
             passkey_shown = true;
             pin_requested = true;
-            ceremony_handle = CONN_HANDLE_NONE;  // callback carries no conn info
+            // This callback carries no connection info, so the ceremony cannot
+            // be attributed to a peer. Leave the handle unset: an unattributable
+            // ceremony must NOT auto-close the window, because "close on any
+            // ceremony" is exactly the cross-talk the handle was added to stop.
+            // The window simply runs its full 60 s instead.
+            ceremony_handle = CONN_HANDLE_NONE;
             Serial.printf("BLE: passkey %04lu — host should type it\n",
                 (unsigned long)pairing_pin_val);
             return pairing_pin_val;
@@ -586,8 +584,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
                 // cycle) can't slam the window shut on a different machine
                 // that is still looking at a code.
                 if (admission_open() && pin_requested && authed &&
-                    (ceremony_handle == CONN_HANDLE_NONE ||
-                     ceremony_handle == info.getConnHandle())) {
+                    ceremony_handle == info.getConnHandle()) {
                     if (!owner_auth[idx]) {
                         owner_auth[idx] = true;
                         save_owners();
@@ -610,15 +607,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             } else {
                 reject_why = "unauthenticated (Just Works) pairing";
             }
-        } else if (owner_count == 0 && is_legacy_bond(id.c_str())) {
-            // Migration: firmware upgraded from a pre-allow-list build — a bond
-            // predating this boot exists but NVS holds no owner list. Restricted
-            // to the boot-time bond snapshot so a stranger that Just-Works pairs
-            // with a factory-fresh device cannot adopt itself as the owner. The
-            // slot inherits the old bond's security level until the machine
-            // re-pairs through the window, which upgrades it.
-            owner_admit_front(id.c_str(), authed);
         } else {
+            // No lazy migration path here: pre-allow-list bonds are adopted
+            // wholesale in ble_init, so by this point the list already knows
+            // every machine that predates the upgrade.
             reject_why = "not an owner and no pairing window is open";
         }
         OWNERS_UNLOCK();
@@ -693,20 +685,29 @@ void ble_init(void) {
     // Restore the owner allow-list and drop any stale non-owner bonds so the
     // board stays paired to just those machines across reboots.
     load_owners();
-    // Snapshot bonds that exist with no owner list — machines paired by a
-    // pre-allow-list build. Only these may be adopted without a pairing
-    // window; anything that bonds later has to come through the PIN.
+    // Migration from a pre-allow-list build: bonds exist but NVS holds no owner
+    // list. Adopt them ALL here, up front. Adopting lazily on first connect
+    // looked tidier but silently destroyed pairings — the first machine to
+    // reconnect became the sole owner, and the prune that follows admission
+    // deleted every other pre-upgrade bond before those machines ever got a
+    // chance to connect. Marked unauthenticated: they keep their old security
+    // level until they re-pair through the window.
     if (owner_count == 0) {
         int n = NimBLEDevice::getNumBonds();
-        for (int i = 0; i < n && legacy_bond_count < MAX_OWNERS; i++) {
-            NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
-            strncpy(legacy_bonds[legacy_bond_count], a.toString().c_str(),
-                    sizeof(legacy_bonds[0]) - 1);
-            legacy_bonds[legacy_bond_count][sizeof(legacy_bonds[0]) - 1] = '\0';
-            Serial.printf("BLE: legacy bond %s eligible for adoption\n",
-                legacy_bonds[legacy_bond_count]);
-            legacy_bond_count++;
+        if (n > MAX_OWNERS) {
+            Serial.printf("BLE: %d legacy bonds but only %d slots — the rest will be dropped\n",
+                n, MAX_OWNERS);
         }
+        for (int i = 0; i < n && owner_count < MAX_OWNERS; i++) {
+            NimBLEAddress a = NimBLEDevice::getBondedAddress(i);
+            strncpy(owner_addrs[owner_count], a.toString().c_str(),
+                    sizeof(owner_addrs[0]) - 1);
+            owner_addrs[owner_count][sizeof(owner_addrs[0]) - 1] = '\0';
+            owner_auth[owner_count] = false;
+            Serial.printf("BLE: adopted legacy bond %s\n", owner_addrs[owner_count]);
+            owner_count++;
+        }
+        if (owner_count > 0) persist_owners_now();
     }
     prune_foreign_bonds();
 
@@ -784,8 +785,11 @@ void ble_tick(void) {
     // typed right before the deadline still completes (admission_open()).
     if (pairing_mode && (int32_t)(millis() - pairing_deadline_ms) >= 0) {
         pairing_mode = false;
-        pin_requested = false;
         need_advertise = true;
+        // pin_requested deliberately survives: admission is still open for the
+        // grace period, and a ceremony that started inside the visible window
+        // completes during it. Clearing here would lose the "this peer went
+        // through a real ceremony" fact and skip the pin-paired upgrade.
         Serial.println("BLE: pairing window timed out");
     }
     // Disarm admission once the grace period lapses. Leaving it armed would
@@ -794,6 +798,17 @@ void ble_tick(void) {
     if (admission_armed && !pairing_mode &&
         (int32_t)(millis() - admission_until_ms) >= 0) {
         admission_armed = false;
+        pin_requested   = false;
+        passkey_shown   = false;
+        ceremony_handle = CONN_HANDLE_NONE;
+        // A confirmation still on screen is now unanswerable — accepting it
+        // would complete an SMP procedure that onAuthenticationComplete is
+        // guaranteed to reject, leaving the host reporting success and then
+        // being dropped. Say no while we still can.
+        if (confirm_pending) {
+            Serial.println("BLE: admission expired with a confirmation pending — rejecting it");
+            ble_confirm_reject();
+        }
         Serial.println("BLE: pairing admission grace expired");
     }
     // Unencrypted-link watchdog: a peer that connects but never encrypts
@@ -876,17 +891,31 @@ void ble_pairing_begin(void) {
         OWNERS_LOCK();
         if (owner_count > 0) strncpy(stalest, owner_addrs[owner_count - 1], sizeof(stalest) - 1);
         OWNERS_UNLOCK();
+        // A slot MUST come free or the window is inert, so this picks a victim
+        // in preference order and always lands on one. Matching only the
+        // stalest owner left the window dead whenever that machine happened not
+        // to be connected — which is the common case, since "stalest" usually
+        // means "away".
+        uint16_t victim = CONN_HANDLE_NONE;
+        uint16_t stalest_h = CONN_HANDLE_NONE, stranger_h = CONN_HANDLE_NONE, any_h = CONN_HANDLE_NONE;
+        OWNERS_LOCK();
         for (uint16_t h : server->getPeerDevices()) {
             NimBLEConnInfo pi = server->getPeerInfoByHandle(h);
-            // Prefer the stalest owner; fall back to whatever is connected if
-            // the peer list and the owner list disagree.
-            if (stalest[0] == '\0' ||
-                strcmp(pi.getIdAddress().toString().c_str(), stalest) == 0) {
-                Serial.printf("BLE: freeing a connection slot for pairing (dropping %s)\n",
-                    pi.getAddress().toString().c_str());
-                server->disconnect(h);
-                break;
-            }
+            std::string pid = pi.getIdAddress().toString();
+            if (stalest[0] && strcmp(pid.c_str(), stalest) == 0) stalest_h = h;
+            else if (owner_index(pid.c_str()) < 0)               stranger_h = h;
+            any_h = h;
+        }
+        OWNERS_UNLOCK();
+        // A non-owner camper costs nothing to drop, so it goes first; only then
+        // the machine that has been away longest; only then whatever is left.
+        victim = (stranger_h != CONN_HANDLE_NONE) ? stranger_h
+               : (stalest_h  != CONN_HANDLE_NONE) ? stalest_h
+                                                  : any_h;
+        if (victim != CONN_HANDLE_NONE) {
+            Serial.printf("BLE: freeing a connection slot for pairing (dropping handle %u)\n",
+                (unsigned)victim);
+            server->disconnect(victim);
         }
     }
 }
@@ -902,6 +931,14 @@ bool     ble_confirm_pending(void) { return confirm_pending; }
 // safe and can't stall the host task.
 void ble_confirm_accept(void) {
     if (!confirm_pending || !server) return;
+    // Accepting after admission lapsed completes an SMP procedure that
+    // onAuthenticationComplete will then reject — the host would report a
+    // successful pairing and be disconnected a moment later.
+    if (!admission_open()) {
+        Serial.println("BLE: confirmation arrived too late — rejecting");
+        ble_confirm_reject();
+        return;
+    }
     confirm_pending = false;
     NimBLEConnInfo pi = server->getPeerInfoByHandle(confirm_handle);
     Serial.println("BLE: numeric comparison accepted");
@@ -937,10 +974,6 @@ uint32_t ble_pairing_code(void) {
 void ble_clear_bonds(void) {
     NimBLEDevice::deleteAllBonds();
     clear_owners();  // release ownership so the board can be handed to other machines
-    // Drop the migration snapshot too: after an explicit wipe nothing is
-    // grandfathered, so every machine — including the one that was paired a
-    // moment ago — has to come back through the pairing window and the PIN.
-    legacy_bond_count = 0;
     pairing_close("bonds cleared");
     Serial.println("BLE: bonds cleared");
     if (state == BLE_STATE_CONNECTED) {
