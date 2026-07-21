@@ -136,6 +136,12 @@ static volatile bool     admission_armed = false; // guards admission_until_ms a
 static volatile uint32_t pairing_pin_val = 0;
 static volatile bool     passkey_shown = false;
 static volatile bool     pin_requested = false;   // stack ran an authenticated flow this window
+// Which connection that flow belongs to. Without it, machine A's routine
+// reconnect would close the window out from under machine B, which is still
+// looking at a code. CONN_HANDLE_NONE means "unknown peer" (the passkey-display
+// callback carries no connection info), which falls back to closing on any
+// completed ceremony.
+static volatile uint16_t ceremony_handle = 0xFFFF;
 
 // Numeric-comparison state. onConfirmPassKey lands on the NimBLE host task and
 // must return immediately — a human takes seconds to look at the screen — so it
@@ -352,6 +358,8 @@ static void pairing_close(const char* why) {
     pairing_mode = false;
     admission_armed = false;
     pin_requested = false;
+    passkey_shown = false;
+    ceremony_handle = CONN_HANDLE_NONE;
     need_advertise = true;
     Serial.printf("BLE: pairing window closed (%s)\n", why);
 }
@@ -504,6 +512,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             pairing_pin_val = 1000 + (esp_random() % 9000);
             passkey_shown = true;
             pin_requested = true;
+            ceremony_handle = CONN_HANDLE_NONE;  // callback carries no conn info
             Serial.printf("BLE: passkey %04lu — host should type it\n",
                 (unsigned long)pairing_pin_val);
             return pairing_pin_val;
@@ -528,6 +537,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         pin_requested   = true;
         confirm_code    = pin;
         confirm_handle  = info.getConnHandle();
+        ceremony_handle = info.getConnHandle();
         confirm_pending = true;
         Serial.printf("BLE: confirm code %06lu from %s — awaiting PWR press\n",
             (unsigned long)pin, info.getAddress().toString().c_str());
@@ -569,16 +579,20 @@ class ServerCallbacks : public NimBLEServerCallbacks {
             if (owner_auth[idx] && !authed) {
                 reject_why = "unauthenticated re-pair of a pin-paired slot";
             } else {
-                // A known owner that re-paired through the window upgrades its
-                // slot, and THAT is what closes the window — not the global
-                // pin_requested flag, which says only that *someone* was shown
-                // the PIN. Keying on the upgrade means a routine bonded
-                // reconnect (the daemon's 60s cycle) can't slam the window shut
-                // on a different machine that is still typing the code.
-                if (admission_open() && pin_requested && authed && !owner_auth[idx]) {
-                    owner_auth[idx] = true;
-                    save_owners();
-                    Serial.printf("BLE: owner %s upgraded to pin-paired\n", id.c_str());
+                // A known owner that re-paired through the window closes it —
+                // leaving "Ready to pair" up after a ceremony this peer just
+                // completed is stale. Gated on the ceremony belonging to THIS
+                // connection so a routine bonded reconnect (the daemon's 60s
+                // cycle) can't slam the window shut on a different machine
+                // that is still looking at a code.
+                if (admission_open() && pin_requested && authed &&
+                    (ceremony_handle == CONN_HANDLE_NONE ||
+                     ceremony_handle == info.getConnHandle())) {
+                    if (!owner_auth[idx]) {
+                        owner_auth[idx] = true;
+                        save_owners();
+                        Serial.printf("BLE: owner %s upgraded to pin-paired\n", id.c_str());
+                    }
                     pairing_close("owner re-paired");
                 }
                 owner_touch(idx, true);
