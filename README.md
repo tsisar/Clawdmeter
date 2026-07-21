@@ -21,7 +21,7 @@ The device boots into the splash. Tap the screen anywhere to switch to the Usage
 | ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png) |
 |   Splash; touch-toggle anytime    | Session and weekly utilization  |
 
-While the splash is up, the middle (PWR) button cycles animations. **Hold the power button for 3 seconds, then release, to put the device into pairing mode** — this clears the saved Bluetooth bond and re-advertises. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
+While the splash is up, the middle (PWR) button cycles animations. **Hold the power button for 3 seconds, then release, to open the pairing window** (the screen prompts you when to let go) — for the next 60 seconds the device is discoverable as "Clawdmeter". Pick it in your computer's Bluetooth settings; both screens then show the same 6-digit number, and you confirm it on the computer and with the device's power button. Outside the window the device advertises anonymously (no name) and new machines cannot pair. Up to 3 machines can be paired; pairing a 4th silently replaces the one that has been away longest. The firmware also auto-rotates animations every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
 
 ## Hardware
 
@@ -62,7 +62,7 @@ The board env name is required. Run `./flash-mac.sh` with no args to see the ava
 
 ### Pair the device
 
-After flashing, open **System Settings → Bluetooth** and click *Connect* next to "Clawdmeter". The daemon only ever connects to the peripheral this Mac is paired/connected to — it never scans for a nearby device — so once it's connected here the daemon picks it up on its next poll (~60 s).
+After flashing, hold the device's power button for 3 seconds and release — the screen tells you when to let go, and the device becomes discoverable for 60 seconds. Open **System Settings → Bluetooth** and click *Connect* next to "Clawdmeter". Both screens show the same 6-digit number: confirm it on the Mac, then press the device's power button to confirm it there too. The daemon only ever connects to the peripheral this Mac is paired/connected to — it never scans for a nearby device — so once it's connected here the daemon picks it up on its next poll (~60 s).
 
 ### Install the daemon
 
@@ -96,18 +96,23 @@ The board env name is required. Run `./flash.sh` with no args to see the availab
 
 ### Pair the device
 
-After flashing, the device advertises as "Clawdmeter". Pair it once:
+Hold the device's power button for 3 seconds and release — the screen tells you when to let go, and the device becomes discoverable for 60 seconds. The simplest route is your desktop's Bluetooth settings panel: pick "Clawdmeter", compare the 6-digit number both screens show, confirm on the computer, then press the device's power button.
+
+From the terminal it is the same flow, but an agent has to be registered *before* pairing starts — without one BlueZ falls back to "no input, no output", which the Bluetooth spec resolves to an unauthenticated Just Works pairing that the device rejects:
 
 ```bash
-# Scan for the device
-bluetoothctl scan le
-
-# When "Clawdmeter" appears, pair and trust it
-bluetoothctl pair F4:12:FA:C0:8F:E5    # use your device's MAC
-bluetoothctl trust F4:12:FA:C0:8F:E5
+bluetoothctl
+[bluetooth]# agent KeyboardDisplay
+[bluetooth]# default-agent
+[bluetooth]# scan on          # only finds it while the pairing window is open
+[bluetooth]# scan off
+[bluetooth]# pair F4:12:FA:C0:8F:E5     # use your device's MAC
+# Compare the 6-digit number against the device screen, answer yes here,
+# then press the device's power button to confirm on its side.
+[bluetooth]# trust F4:12:FA:C0:8F:E5
 ```
 
-To re-pair later, hold the power button for 3 seconds then release — the device clears its saved bond and re-advertises.
+To pair another machine later, repeat the same gesture there. Up to 3 machines can be paired at once; a 4th replaces the one that has been away longest. To forget all paired machines at once, send `clearbonds` over the USB serial console.
 
 ### Install the daemon
 
@@ -143,7 +148,7 @@ Run `pio run -d firmware` with no env to see the available board envs.
 
 ### Pair the device
 
-The device is a bonded BLE HID keyboard, so pair it once: **Settings → Bluetooth & devices → Add device → Bluetooth**, then select "Clawdmeter". Pairing is **required** — it enables the physical buttons and keeps a persistent connection (the device keeps showing your last-synced usage even after the daemon quits). To undo, use **Remove device** (this disables the buttons).
+The device is a bonded BLE HID keyboard, so pair it once: hold the device's power button for 3 seconds and release — the screen tells you when to let go, and it becomes discoverable for 60 seconds. Then **Settings → Bluetooth & devices → Add device → Bluetooth**, select "Clawdmeter", compare the 6-digit number Windows shows against the device screen, confirm in Windows, and press the device's power button. Pairing is **required** — it enables the physical buttons and keeps a persistent connection (the device keeps showing your last-synced usage even after the daemon quits). To undo, use **Remove device** (this disables the buttons).
 
 ### Install the daemon (recommended)
 
@@ -198,19 +203,19 @@ reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v Clawdmeter /f
 
 ## Physical buttons
 
-The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, triggers pairing mode.
+The board has three side buttons. Left and right send HID keys; the middle (PWR) button cycles splash animations and, held for 3 seconds, opens the pairing window (discoverable for 60 s).
 
 | Button           | GPIO         | Function                                                       |
 | ---------------- | ------------ | -------------------------------------------------------------- |
 | **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)       |
-| **Middle** (PWR) | AXP2101 PKEY | On splash: cycle animations. Hold 3s + release: pairing mode |
+| **Middle** (PWR) | AXP2101 PKEY | On splash: cycle animations. Hold 3s + release: pairing window. While a pairing code is up: confirm it |
 | **Right**        | GPIO 18      | Press to send Shift+Tab (Claude Code mode toggle)              |
 
 Space and Shift+Tab go out as standard BLE HID keyboard reports, so they trigger in whatever window has focus on the paired host — not just Claude Code.
 
 ## BLE protocol
 
-The device advertises a custom GATT service alongside the standard HID keyboard service:
+The device serves a custom GATT service alongside the standard HID keyboard service. Both UUIDs are only *advertised* during the pairing window — outside it the device advertises anonymously (no name, no service UUIDs) and is connectable only by machines that already know its address:
 
 |                            | UUID                                   |
 | -------------------------- | -------------------------------------- |

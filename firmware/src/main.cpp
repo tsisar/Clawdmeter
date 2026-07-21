@@ -174,6 +174,13 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) send_screenshot();
             else if (strcmp(cmd_buf, "buzz") == 0)  sound_hal_play_reset();
+            // Full reset — forget every paired machine (the hold-PWR gesture
+            // now opens the pairing window instead of wiping bonds; stale
+            // machines normally rotate out via slot eviction).
+            else if (strcmp(cmd_buf, "clearbonds") == 0) {
+                ble_clear_bonds();
+                Serial.println("CLEARBONDS_OK");
+            }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
             cmd_buf[cmd_pos++] = c;
@@ -239,15 +246,16 @@ void setup() {
 
 static ble_state_t last_ble_state = BLE_STATE_INIT;
 
-// Hold-to-pair gesture: hold the PWR button ~3s, then RELEASE → clear all BLE
-// bonds and re-advertise. Clearing on *release* (not while held) is deliberate:
-// holding to power the device OFF (AXP hardware shutdown at 8s) must not wipe
-// the bond — a power-off hold never releases before shutdown. To stop a
-// "chicken-out" release just before 8s from pairing, the gesture disarms at 6s.
+// Hold-to-pair gesture: hold the PWR button ~3s, then RELEASE → open the
+// pairing window (discoverable + on-screen PIN; see ble_pairing_begin).
+// Firing on *release* (not while held) is deliberate: holding to power the
+// device OFF (AXP hardware shutdown at 8s) must not open the window — a
+// power-off hold never releases before shutdown. To stop a "chicken-out"
+// release just before 8s from pairing, the gesture disarms at 6s.
 //
 //   ~1.5s long-press edge → PENDING
-//   3.0s (+1500)          → ARMED   (release from here clears bonds)
-//   6.0s (+4500)          → DISARMED (no clear; AXP powers off at 8s)
+//   3.0s (+1500)          → ARMED   (release from here opens the window)
+//   6.0s (+4500)          → DISARMED (no window; AXP powers off at 8s)
 #define PAIR_ARM_AFTER_LONG_MS    1500   // 3.0s total
 #define PAIR_DISARM_AFTER_LONG_MS 4500   // 6.0s total
 enum pair_state_t { PAIR_IDLE, PAIR_PENDING, PAIR_ARMED };
@@ -259,6 +267,11 @@ static void pair_tick(void) {
         pair_state = PAIR_PENDING;
         pair_long_seen_ms = millis();
         (void)power_hal_pwr_released();  // drain any stale release edge
+        // Tell the user to keep holding. Without on-screen feedback the whole
+        // gesture is performed blind, and overshooting the release window
+        // lands on the AXP's hardware power-off instead of pairing.
+        ui_update_pair_arm(1);
+        idle_note_activity();  // the panel must be lit to show the prompt
         Serial.println("PWR long-press: hold to ~3s then release to pair");
         return;
     }
@@ -266,23 +279,27 @@ static void pair_tick(void) {
 
     if (power_hal_pwr_released()) {
         if (pair_state == PAIR_ARMED) {
-            Serial.println("Pair: released in window — clearing bonds, advertising");
-            ble_clear_bonds();
+            Serial.println("Pair: released in window — opening pairing window");
+            ble_pairing_begin();
         } else {
             Serial.println("Pair: released too early — cancelled");
         }
         pair_state = PAIR_IDLE;
+        ui_update_pair_arm(0);
         return;
     }
 
     uint32_t held = millis() - pair_long_seen_ms;
     if (pair_state == PAIR_PENDING && held >= PAIR_ARM_AFTER_LONG_MS) {
         pair_state = PAIR_ARMED;
+        ui_update_pair_arm(2);   // "Release now to pair"
         Serial.println("Pair: armed — release to pair");
     } else if (pair_state == PAIR_ARMED && held >= PAIR_DISARM_AFTER_LONG_MS) {
         pair_state = PAIR_IDLE;  // power-off territory; don't pair
+        ui_update_pair_arm(0);
         Serial.println("Pair: disarmed (holding toward power-off)");
     }
+    if (pair_state != PAIR_IDLE) idle_note_activity();
 }
 
 void loop() {
@@ -341,10 +358,14 @@ void loop() {
 
         if (power_hal_pwr_pressed()) {
             if (!idle_consume_wake_press()) {
-                // On splash: cycle animations. On the usage view: cycle
-                // screen brightness (single non-splash view, no more screens).
-                if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
-                else                                          brightness_cycle();
+                // A pending numeric comparison owns the button: this press IS
+                // the "yes, the codes match" answer. Otherwise, with the code
+                // up a press dismisses it; on splash it cycles animations; on
+                // the usage view it cycles brightness.
+                if (ble_confirm_pending())                         ble_confirm_accept();
+                else if (ble_pairing_active())                     ble_pairing_cancel();
+                else if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
+                else                                               brightness_cycle();
             }
         }
 
@@ -356,6 +377,26 @@ void loop() {
         last_ble_state = bs;
         ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
     }
+
+    // Pairing window → PIN screen. Keep the panel awake while the code is up
+    // so the idle fade can't hide it mid-pairing. The PIN is part of the
+    // trigger, not just the active flag: repeating the gesture while the
+    // window is open mints a fresh code, and a screen still showing the old
+    // one would send the user to a PIN that can no longer pair.
+    // A pending numeric comparison outranks the window's own PIN: it is the
+    // code the computer is showing right now, and it must stay up even after
+    // the 60s window lapses, or the user is asked to match a code that is no
+    // longer on screen.
+    static ble_pair_view_t last_view = BLE_PAIR_VIEW_NONE;
+    static uint32_t        last_code = 0;
+    ble_pair_view_t view_now = ble_pairing_view();
+    uint32_t        code_now = ble_pairing_code();
+    if (view_now != last_view || (view_now != BLE_PAIR_VIEW_NONE && code_now != last_code)) {
+        last_view = view_now;
+        last_code = code_now;
+        ui_update_pairing(view_now, code_now);
+    }
+    if (view_now != BLE_PAIR_VIEW_NONE) idle_note_activity();
 
     static int  last_pct      = -2;
     static bool last_charging = false;
