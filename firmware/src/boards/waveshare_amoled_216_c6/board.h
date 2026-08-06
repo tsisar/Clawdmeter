@@ -53,7 +53,10 @@
 
 // ---- Capability flags ----
 #define BOARD_HAS_SECONDARY_BUTTON 1
-#define BOARD_HAS_ROTATION         0    // C6 has no PSRAM headroom for the rotation strip
-#define BOARD_HAS_IMU              1    // present + initialized for I2C bus health
+// Rotation strip lives in internal SRAM here (no PSRAM). It is sized to one
+// LVGL flush chunk, and main.cpp already shrinks those to BUF_LINES=20 on
+// PSRAM-free boards, so the strip costs 480x20x2 = 19 KB — affordable.
+#define BOARD_HAS_ROTATION         1
+#define BOARD_HAS_IMU              1    // QMI8658, drives the rotation quadrant
 #define BOARD_HAS_BATTERY          1
 #define BOARD_HAS_IO_EXPANDER      0    // TCA9554 exists on board but only services audio
