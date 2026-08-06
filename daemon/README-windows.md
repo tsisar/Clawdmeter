@@ -14,7 +14,7 @@ the manual-run fallback, and how to manage or remove autostart.
 | **Python 3.11+** | Download from [python.org](https://www.python.org/downloads/) if not already installed. Ensure "Add python.exe to PATH" is checked during install. |
 | **Claude Code installed** | Install Claude Code and complete `claude login` so credentials exist on disk. |
 | **Clawdmeter powered on** | The device must be powered on and in range before the daemon starts. |
-| **Paired with Windows Bluetooth** | Pair the device once via **Settings → Bluetooth & devices → Add device** (see [Pair the device](#pair-the-device-one-time)). This is required — the device is a bonded BLE HID keyboard, so pairing enables its physical buttons and keeps a persistent connection that shows your last usage even when the daemon is stopped. |
+| **Paired with Windows Bluetooth** | Pair the device once — hold its power button 3 s to reveal a PIN, then **Settings → Bluetooth & devices → Add device** (see [Pair the device](#pair-the-device-one-time)). This is required — the device is a bonded BLE HID keyboard, so pairing enables its physical buttons and keeps a persistent connection that shows your last usage even when the daemon is stopped. |
 
 ### Where are my credentials?
 
@@ -40,9 +40,16 @@ enables bonding (`NimBLEDevice::setSecurityAuth`) and advertises the HID service
 physical buttons act as a keyboard (Space / Shift+Tab). Pair it with Windows **once**,
 before running the daemon:
 
-1. Put the device on its Bluetooth waiting screen (powered on, not yet connected).
-2. Open **Settings → Bluetooth & devices → Add device → Bluetooth**.
-3. Select **Clawdmeter** and complete pairing.
+1. Power the device on.
+2. Hold its power button for ~3 seconds, then release — the screen tells you when to
+   let go. The device only advertises its name for 60 s after that; the rest of the
+   time it is deliberately undiscoverable.
+3. Open **Settings → Bluetooth & devices → Add device → Bluetooth**.
+4. Select **Clawdmeter**. Windows shows a 6-digit number and the device shows the
+   same one — confirm in Windows, then press the device's power button.
+
+Up to 3 machines can be paired at once. Pairing a 4th replaces whichever machine has
+been away longest.
 
 **Why this is required:**
 

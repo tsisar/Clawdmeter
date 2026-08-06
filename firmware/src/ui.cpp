@@ -249,6 +249,13 @@ static int      clock_fmt = 24;   // 12 or 24, set from the daemon payload
 static int      clock_last_min = -1;   // last rendered minute; avoids redrawing the title every tick
 static lv_obj_t* usage_group;   // the two usage panels — shown when connected
 static lv_obj_t* pair_group;    // pairing hint — shown when disconnected
+static lv_obj_t* pin_group;     // pairing-window PIN — shown while discoverable
+static lv_obj_t* lbl_pin_code;  // the digits themselves
+static lv_obj_t* lbl_pin_title; // "Pair code" / "Same code?"
+static lv_obj_t* lbl_pin_hint;  // instruction line under the digits
+static bool s_pairing = false;  // pairing window open (ui_update_pairing)
+static lv_obj_t* pair_arm_box;  // hold-to-pair feedback, floats on the top layer
+static lv_obj_t* lbl_pair_arm;
 static lv_obj_t* bar_session;
 static lv_obj_t* lbl_session_pct;
 static lv_obj_t* lbl_session_label;
@@ -278,7 +285,7 @@ static lv_obj_t* idle_group;            // the "Zzz" idle screen
 static uint32_t  last_data_ms = 0;      // lv_tick when the last valid usage update landed
 static bool      data_received = false; // any valid update since boot
 static bool      data_ok = true;        // last payload's ok flag; a {"ok":false} beat = "no fresh data"
-static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage
+static int       view_state = -1;       // -1 unknown / 0 pair / 1 idle / 2 usage / 3 PIN
 static const uint32_t DATA_FRESH_MS = 90000;  // usage counts as "live" within this window (daemon sends ~60s)
 
 // ---- Shared ----
@@ -496,6 +503,50 @@ static void build_pair_group(lv_obj_t* parent) {
     lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);  // ui_update_ble_status decides
 }
 
+// Pairing-window PIN — full-screen 4 digits the connecting host must type.
+// Shown only while the pairing window is open (hold-PWR gesture); layout
+// mirrors the pairing hint: title up top, the code dead center, hint below.
+static void build_pin_group(lv_obj_t* parent) {
+    pin_group = lv_obj_create(parent);
+    lv_obj_set_size(pin_group, L.scr_w, L.scr_h - L.content_y);
+    lv_obj_set_pos(pin_group, 0, L.content_y);
+    lv_obj_set_style_bg_opa(pin_group, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pin_group, 0, 0);
+    lv_obj_set_style_pad_all(pin_group, 0, 0);
+    lv_obj_clear_flag(pin_group, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(pin_group, LV_OBJ_FLAG_EVENT_BUBBLE);
+
+    lbl_pin_title = lv_label_create(pin_group);
+    lv_obj_t* l1 = lbl_pin_title;
+    lv_label_set_text(l1, "Pair code");
+    lv_obj_set_style_text_font(l1, L.bt_status_font, 0);
+    lv_obj_set_style_text_color(l1, COL_TEXT, 0);
+    lv_obj_align(l1, LV_ALIGN_TOP_MID, 0, L.pair_y1);
+
+    lbl_pin_code = lv_label_create(pin_group);
+    lv_label_set_text(lbl_pin_code, "0000");
+    lv_obj_set_style_text_font(lbl_pin_code, L.title_font, 0);
+    lv_obj_set_style_text_letter_space(lbl_pin_code, 6, 0);
+    lv_obj_set_style_text_color(lbl_pin_code, COL_TEXT, 0);
+    lv_obj_align(lbl_pin_code, LV_ALIGN_CENTER, 0, 0);
+
+    // Wrapped and width-bounded: the hint is the longest string on the screen
+    // and would run off both edges of the narrower panels as a single line.
+    // Sits above the status strip (lbl_anim lives on the container, not in
+    // this group, and is hidden for the duration — see ui_update_pairing).
+    lbl_pin_hint = lv_label_create(pin_group);
+    lv_obj_t* l3 = lbl_pin_hint;
+    lv_label_set_text(l3, "enter it on your computer");
+    lv_label_set_long_mode(l3, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(l3, L.content_w);
+    lv_obj_set_style_text_align(l3, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(l3, L.bt_device_font, 0);
+    lv_obj_set_style_text_color(l3, COL_DIM, 0);
+    lv_obj_align(l3, LV_ALIGN_BOTTOM_MID, 0, -L.margin);
+
+    lv_obj_add_flag(pin_group, LV_OBJ_FLAG_HIDDEN);  // ui_update_pairing decides
+}
+
 // Idle "Zzz" screen — shown when the host is connected but no usage update has
 // landed recently (token expired, daemon down, host asleep…). Full-screen, like
 // the pairing hint, so we never render hours-old numbers as if they were live.
@@ -516,6 +567,36 @@ static void build_idle_group(lv_obj_t* parent) {
     if (creature) lv_obj_align(creature, LV_ALIGN_CENTER, 0, -20);
 
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);  // update_view_state decides
+}
+
+// Hold-to-pair feedback. The gesture only fires if the button is released
+// inside a 3s..6s window — without a prompt the user is holding blind, and
+// overshooting runs into the AXP's 8s hardware power-off instead of pairing.
+// Lives on the top layer so it shows over the splash too, where the gesture
+// is most often performed.
+static void build_pair_arm_banner(void) {
+    // Full-screen black, not a band: a partial strip leaves the usage panels
+    // showing around it and reads as a rendering glitch rather than a prompt.
+    pair_arm_box = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(pair_arm_box, L.scr_w, L.scr_h);
+    lv_obj_set_pos(pair_arm_box, 0, 0);
+    lv_obj_set_style_bg_color(pair_arm_box, COL_BG, 0);
+    lv_obj_set_style_bg_opa(pair_arm_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(pair_arm_box, 0, 0);
+    lv_obj_set_style_border_width(pair_arm_box, 0, 0);
+    lv_obj_set_style_pad_all(pair_arm_box, L.margin, 0);
+    lv_obj_clear_flag(pair_arm_box, LV_OBJ_FLAG_SCROLLABLE);
+    // Must not swallow touches — the top layer sits above everything.
+    lv_obj_clear_flag(pair_arm_box, LV_OBJ_FLAG_CLICKABLE);
+
+    lbl_pair_arm = lv_label_create(pair_arm_box);
+    lv_label_set_long_mode(lbl_pair_arm, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_pair_arm, L.content_w);
+    lv_obj_set_style_text_align(lbl_pair_arm, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_font(lbl_pair_arm, L.bt_status_font, 0);
+    lv_obj_center(lbl_pair_arm);
+
+    lv_obj_add_flag(pair_arm_box, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void init_usage_screen(lv_obj_t* scr) {
@@ -588,6 +669,7 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_label_set_recolor(lbl_weekly_reset, true);
 
     build_pair_group(usage_container);
+    build_pin_group(usage_container);
     build_idle_group(usage_container);
 
     // Status line — always visible on the usage view. Driven by ui_tick_anim().
@@ -612,6 +694,7 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
+    build_pair_arm_banner();
     splash_init(scr);
 
     if (splash_get_root()) {
@@ -723,9 +806,11 @@ void ui_update(const UsageData* data) {
 // on an actual change. The animated status line stays visible everywhere — it
 // reads "Listening…" on the idle screen, keeping it alive rather than frozen.
 static void update_view_state(void) {
-    if (!usage_group || !pair_group || !idle_group) return;
+    if (!usage_group || !pair_group || !idle_group || !pin_group) return;
     int v;
-    if (!s_ble_connected) {
+    if (s_pairing) {
+        v = 3;  // pairing-window PIN — trumps everything while the window is open
+    } else if (!s_ble_connected) {
         v = 0;  // pairing hint
     } else if (data_received && data_ok && (lv_tick_get() - last_data_ms) < DATA_FRESH_MS) {
         v = 2;  // live usage
@@ -737,7 +822,9 @@ static void update_view_state(void) {
     lv_obj_add_flag(pair_group, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(idle_group, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(usage_group, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group : usage_group,
+    lv_obj_add_flag(pin_group, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(v == 0 ? pair_group : v == 1 ? idle_group :
+                      v == 2 ? usage_group : pin_group,
                       LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -808,6 +895,9 @@ static void apply_battery_visibility(void) {
 
 static void global_click_cb(lv_event_t* e) {
     (void)e;
+    // A stray tap must not bury the PIN behind the splash mid-pairing; the
+    // window is dismissed with the PWR button (or by pairing/timing out).
+    if (s_pairing) return;
     if (current_screen == SCREEN_SPLASH) ui_show_screen(prev_non_splash_screen);
     else                                  ui_show_screen(SCREEN_SPLASH);
 }
@@ -848,6 +938,65 @@ void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) 
 
     if (s_ble_connected && !was_connected) connected_at_ms = lv_tick_get();
     // pair / idle / usage — picked from connection + data freshness.
+    update_view_state();
+}
+
+void ui_update_pair_arm(int stage) {
+    if (!pair_arm_box) return;
+    if (stage == 0) {
+        lv_obj_add_flag(pair_arm_box, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (stage == 1) {
+        lv_label_set_text(lbl_pair_arm, "Keep holding");
+        lv_obj_set_style_text_color(lbl_pair_arm, COL_DIM, 0);
+    } else {
+        lv_label_set_text(lbl_pair_arm, "Release now to pair");
+        lv_obj_set_style_text_color(lbl_pair_arm, COL_ACCENT, 0);
+    }
+    lv_obj_clear_flag(pair_arm_box, LV_OBJ_FLAG_HIDDEN);
+}
+
+void ui_update_pairing(ble_pair_view_t view, uint32_t code) {
+    bool active = (view != BLE_PAIR_VIEW_NONE);
+    s_pairing = active;
+    if (active && lbl_pin_code) {
+        char buf[12];
+        switch (view) {
+        case BLE_PAIR_VIEW_CONFIRM:
+            // Numeric-comparison codes are 6 digits and MUST be zero-padded:
+            // the computer renders them padded, and a mismatch in leading
+            // zeros reads to the user as "the codes don't match".
+            snprintf(buf, sizeof(buf), "%06lu", (unsigned long)code);
+            lv_label_set_text(lbl_pin_title, "Same code?");
+            lv_label_set_text(lbl_pin_hint,
+                board_caps().button_count >= 1
+                    ? "power button = yes, side button = no"
+                    : "press the power button to confirm");
+            break;
+        case BLE_PAIR_VIEW_PASSKEY:
+            snprintf(buf, sizeof(buf), "%lu", (unsigned long)code);
+            lv_label_set_text(lbl_pin_title, "Pair code");
+            lv_label_set_text(lbl_pin_hint, "enter it on your computer");
+            break;
+        default:  // WAITING — the host hasn't picked a method, so no code yet
+            buf[0] = '\0';
+            lv_label_set_text(lbl_pin_title, "Ready to pair");
+            lv_label_set_text(lbl_pin_hint, "pick Clawdmeter on your computer");
+            break;
+        }
+        lv_label_set_text(lbl_pin_code, buf);
+    }
+    // The status line lives on the container, not inside a view group, so it
+    // would sit on top of the PIN hint on the shorter panels — and "Waiting…"
+    // is noise while a code is up. Hide it for the duration.
+    if (lbl_anim) {
+        if (active) lv_obj_add_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
+        else        lv_obj_clear_flag(lbl_anim, LV_OBJ_FLAG_HIDDEN);
+    }
+    // The gesture can be performed from the splash — pull the usage container
+    // forward so the PIN is actually visible.
+    if (active && current_screen == SCREEN_SPLASH) ui_show_screen(SCREEN_USAGE);
     update_view_state();
 }
 
